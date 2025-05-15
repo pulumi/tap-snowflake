@@ -157,7 +157,7 @@ class SnowflakeConnector(SQLConnector):
         for option in ["database", "schema", "warehouse", "role"]:
             if config.get(option):
                 params[option] = config.get(option)
-
+                
         return URL(**params)
 
     @contextlib.contextmanager
@@ -217,33 +217,54 @@ class SnowflakeConnector(SQLConnector):
         tables = [t.lower() for t in self.config.get("tables", [])]
         engine = self.create_engine()
         inspected = sqlalchemy.inspect(engine)
-        schema_names = [
-            self._dialect.identifier_preparer.quote(schema_name)
-            for schema_name in self.get_schema_names(engine, inspected)
-            if schema_name.lower() != "information_schema"
-        ]
-        not_tables = not tables
-        table_schemas = {} if not_tables else {x.split(".")[0] for x in tables}
-        table_schema_names = [
-            x for x in schema_names if x in table_schemas
-        ] or schema_names
-        for schema_name in table_schema_names:
-            # Iterate through each table and view of relevant schemas
-            for table_name, is_view in self.get_object_names(
-                engine,
-                inspected,
-                schema_name,
-            ):
-                if not_tables or (f"{schema_name}.{table_name}" in tables):
-                    catalog_entry = self.discover_catalog_entry(
-                        engine,
-                        inspected,
-                        schema_name,
-                        table_name,
-                        is_view,
+        tables = [t.lower() for t in tables]
+        if tables:
+            table_database_schemas = set((x.split(".")[0], x.split(".")[1]) for x in tables)
+            table_schema_names = {}
+            for database, schema in table_database_schemas:
+                if database not in table_schema_names:
+                    table_schema_names[database] = []
+                table_schema_names[database].append(schema)
+        else:
+            table_schema_names = {}
+            self.logger.warning(
+                "No tables specified in config. "
+                "Will not be able to discover catalog entries.",
+            )
+            return []
+            
+        for database, schemas in table_schema_names.items():
+            for schema in schemas:
+                if schema not in inspected.get_schema_names(database=database, schema=schema):
+                    self.logger.warning(
+                        f"Schema '{schema}' on '{database}' not found in Snowflake. "
+                        "Skipping catalog discovery.",
                     )
-                    result.append(catalog_entry.to_dict())
-
+                    continue
+                self.logger.info(
+                    f"Discovering catalog entries for '{database}.{schema}'",)
+                # Iterate through each table and view of relevant schemas
+                for table_name in inspected.get_table_names(schema=schema, database=database):
+                    if f"{database}.{schema}.{table_name}".lower() in tables:
+                        catalog_entry = self.discover_catalog_entry(
+                            engine,
+                            inspected,
+                            schema,
+                            table_name,
+                            False,
+                        )
+                        result.append(catalog_entry.to_dict())
+                for view_name in inspected.get_view_names(schema=schema, database=database):
+                    if f"{database}.{schema}.{view_name}".lower() in tables:
+                        catalog_entry = self.discover_catalog_entry(
+                            engine,
+                            inspected,
+                            schema,
+                            view_name,
+                            True,
+                        )
+                        result.append(catalog_entry.to_dict())
+                        
         return result
 
     def get_table_profile(
